@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { TEXT_MODEL } from "@/lib/env";
+import { GOOGLE_LOCATION, TEXT_MODEL, requireEnv } from "@/lib/env";
+import { googleAccessToken } from "@/lib/google-auth";
 import { ProviderHttpError } from "@/lib/provider-error";
 import type { Project, ReelPlan } from "@/lib/types";
 
@@ -21,10 +22,16 @@ export const plan = z.object({
 });
 
 export async function createReelPlan(project: Project): Promise<ReelPlan> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent?key=${apiKey}`;
+  const cloudProject = requireEnv("GOOGLE_CLOUD_PROJECT");
+  const accessToken = await googleAccessToken();
+  const location = encodeURIComponent(GOOGLE_LOCATION);
+  const apiHost =
+    GOOGLE_LOCATION === "global"
+      ? "aiplatform.googleapis.com"
+      : `${GOOGLE_LOCATION}-aiplatform.googleapis.com`;
+  const url =
+    `https://${apiHost}/v1/projects/${encodeURIComponent(cloudProject)}` +
+    `/locations/${location}/publishers/google/models/${encodeURIComponent(TEXT_MODEL)}:generateContent`;
   const requestBody = {
     contents: [
       {
@@ -43,7 +50,10 @@ export async function createReelPlan(project: Project): Promise<ReelPlan> {
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
       body: JSON.stringify(requestBody)
     });
   } catch (error) {
