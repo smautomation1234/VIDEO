@@ -1,4 +1,4 @@
-import { ASSET_BUCKET, GOOGLE_LOCATION, OMNI_MODEL } from "@/lib/env";
+import { ASSET_BUCKET, GOOGLE_LOCATION, OMNI_MODEL, TEXT_MODEL } from "@/lib/env";
 import { googleAccessToken } from "@/lib/google-auth";
 import { createReelPlan } from "@/lib/planner";
 import {
@@ -31,7 +31,7 @@ async function runPromptJob(db: DB, job: GenerationJob) {
   const project = await getProject(db, job.project_id);
   const startedAt = job.started_at || new Date().toISOString();
   await updateJob(db, job.id, { started_at: startedAt });
-  await event(db, job.id, "info", "Generating fact-checked script and Omni prompts with Gemini 2.5 Flash.", { model: "gemini-2.5-flash", web_search: true });
+  await event(db, job.id, "info", `Generating fact-checked script and Omni prompts with ${TEXT_MODEL}.`, { model: TEXT_MODEL, web_search: true });
   const result = await createReelPlan(project);
   await updateProject(db, project.id, { prompt_plan: result, state: "review" });
   await updateJob(db, job.id, {
