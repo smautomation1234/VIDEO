@@ -33,6 +33,6 @@ export function requireSupabaseSecret() {
 }
 
 export const ASSET_BUCKET = "project-assets";
-export const TEXT_MODEL = "gemini-2.5-flash";
+export const TEXT_MODEL = "gemini-3.5-flash-lite";
 export const OMNI_MODEL = "gemini-omni-flash-preview";
 export const GOOGLE_LOCATION = process.env.GOOGLE_CLOUD_LOCATION || "global";
