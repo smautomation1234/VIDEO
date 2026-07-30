@@ -22,6 +22,35 @@ export const plan = z.object({
 });
 
 export async function createReelPlan(project: Project): Promise<ReelPlan> {
+  const prompt = plannerPrompt(project);
+  const firstResponse = await requestPlannerResponse(prompt);
+  try {
+    return parseAndValidatePlan(firstResponse, project.target_duration_seconds);
+  } catch (firstError) {
+    const reason =
+      firstError instanceof Error ? firstError.message : String(firstError);
+    const correctionPrompt = `${prompt}
+
+CORRECTION REQUIRED:
+Your previous response was invalid: ${reason}
+Regenerate the complete JSON plan from scratch. Return exactly ${project.target_duration_seconds / 10} clips. Every clip must be exactly 10 seconds, clip numbers must be sequential, and the duration sum must be exactly ${project.target_duration_seconds} seconds. Do not return the previous invalid duration map.`;
+    const correctedResponse = await requestPlannerResponse(correctionPrompt);
+    try {
+      return parseAndValidatePlan(
+        correctedResponse,
+        project.target_duration_seconds
+      );
+    } catch (secondError) {
+      const correctedReason =
+        secondError instanceof Error ? secondError.message : String(secondError);
+      throw new Error(
+        `Gemini returned an invalid clip map after automatic correction. ${correctedReason}`
+      );
+    }
+  }
+}
+
+async function requestPlannerResponse(prompt: string): Promise<string> {
   const cloudProject = requireEnv("GOOGLE_CLOUD_PROJECT");
   const accessToken = await googleAccessToken();
   const location = encodeURIComponent(GOOGLE_LOCATION);
@@ -37,7 +66,7 @@ export async function createReelPlan(project: Project): Promise<ReelPlan> {
       {
         role: "user",
         parts: [
-          { text: plannerPrompt(project) }
+          { text: prompt }
         ]
       }
     ],
@@ -77,11 +106,45 @@ export async function createReelPlan(project: Project): Promise<ReelPlan> {
     throw new Error("Gemini returned an empty response.");
   }
 
+  return text;
+}
+
+export function parseAndValidatePlan(
+  text: string,
+  targetDurationSeconds: number
+): ReelPlan {
   const parsed = plan.parse(extractJson(text));
   const expected = parsed.clips.map((c) => c.clip_number);
-  if (expected.some((value, index) => value !== index + 1)) throw new Error("Gemini returned non-sequential clip numbers.");
+  if (expected.some((value, index) => value !== index + 1)) {
+    throw new Error("Gemini returned non-sequential clip numbers.");
+  }
+
+  const expectedClipCount = targetDurationSeconds / 10;
+  if (!Number.isInteger(expectedClipCount) || expectedClipCount < 1) {
+    throw new Error(
+      `Target duration ${targetDurationSeconds}s is not a positive 10-second increment.`
+    );
+  }
+  if (parsed.clips.length !== expectedClipCount) {
+    throw new Error(
+      `Gemini returned ${parsed.clips.length} clips; exactly ${expectedClipCount} are required.`
+    );
+  }
+  const invalidDuration = parsed.clips.find(
+    (item) => item.duration_seconds !== 10
+  );
+  if (invalidDuration) {
+    throw new Error(
+      `Gemini returned a ${invalidDuration.duration_seconds}s clip; every clip must be exactly 10 seconds.`
+    );
+  }
+
   const sum = parsed.clips.reduce((total, item) => total + item.duration_seconds, 0);
-  if (Math.abs(sum - project.target_duration_seconds) > 4) throw new Error(`Gemini clip map totals ${sum}s, outside the allowed target tolerance.`);
+  if (sum !== targetDurationSeconds) {
+    throw new Error(
+      `Gemini clip map totals ${sum}s; exactly ${targetDurationSeconds}s is required.`
+    );
+  }
 
   return parsed;
 }
@@ -124,6 +187,7 @@ RAW POST:
 ${project.raw_post}
 
 TARGET TOTAL DURATION: ${project.target_duration_seconds} seconds
+REQUIRED CLIP COUNT: exactly ${project.target_duration_seconds / 10}
 OUTPUT: ${project.aspect_ratio}, ${project.resolution}
 ONLY STYLE AVAILABLE: Paper Effect + Motion Graphics
 
@@ -134,7 +198,10 @@ SCRIPT RULES
 - Do not miss, repeat, or cut off a required spoken word. Avoid tongue-twisting constructions.
 - PLAIN pacing = 4.3 spoken words/second. DENSE pacing = 3.3 spoken words/second. A dense line has two or more of: number, unit, model name, comparison.
 - Estimate dense_fraction. Effective wps = 1 / ((dense_fraction/3.3)+((1-dense_fraction)/4.3)). Word ceiling = target seconds × 0.85 × effective wps.
-- Split only into 4, 6, 8, or 10 second clips. Clip-duration sum must be within 4 seconds of the target.
+- Return exactly ${project.target_duration_seconds / 10} clips.
+- Every clip must be exactly 10 seconds. Do not use 4, 6, or 8-second clips.
+- Clip numbers must start at 1 and remain sequential.
+- The clip-duration sum must be exactly ${project.target_duration_seconds} seconds with no tolerance.
 - Keep each spoken_line conservatively short enough for a natural pace. Do not cram.
 
 OMNI PROMPT RULES

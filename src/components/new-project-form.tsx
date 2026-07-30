@@ -2,6 +2,7 @@
 
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { SCRATCH_DURATION_OPTIONS } from "@/features/project/duration";
 import { createClient } from "@/lib/supabase/client";
 
 const initial = { title: "", raw_post: "", target_duration_seconds: 30, aspect_ratio: "9:16", resolution: "720p", style: "paper_motion", mode: "from_scratch" } as const;
@@ -42,7 +43,7 @@ export function NewProjectForm() {
     <label>Project title<input required value={String(form.title)} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Grok 4.5 launch explained" /></label>
     <label>Raw post or script<textarea required rows={11} value={String(form.raw_post)} onChange={(e) => setForm({ ...form, raw_post: e.target.value })} placeholder="Paste the full source post. Gemini will fact-check, rewrite pronunciation, fit the duration and generate every clip prompt." /></label>
     <div className="two-columns">
-      <label>Target duration<select value={String(form.target_duration_seconds)} onChange={(e) => setForm({ ...form, target_duration_seconds: Number(e.target.value) })}><option value="20">20 seconds</option><option value="30">30 seconds</option><option value="40">40 seconds</option><option value="60">60 seconds</option><option value="90">90 seconds</option></select></label>
+      <label>Target duration<select value={String(form.target_duration_seconds)} onChange={(e) => setForm({ ...form, target_duration_seconds: Number(e.target.value) })}>{SCRATCH_DURATION_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{seconds} seconds</option>)}</select></label>
       <label>Aspect ratio<select value={String(form.aspect_ratio)} onChange={(e) => setForm({ ...form, aspect_ratio: e.target.value })}><option value="9:16">9:16 · Instagram Reel</option><option value="16:9">16:9 · Landscape</option></select></label>
     </div>
     <div className="two-columns">

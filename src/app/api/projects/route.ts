@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { isScratchDuration } from "@/features/project/duration";
 import { requireUser, unauthenticatedResponse } from "@/lib/auth";
 
 const schema = z.object({
@@ -10,6 +11,17 @@ const schema = z.object({
   resolution: z.literal("720p"),
   style: z.literal("paper_motion"),
   mode: z.enum(["from_scratch", "edit_video"]).default("from_scratch"),
+}).superRefine((value, context) => {
+  if (
+    value.mode === "from_scratch" &&
+    !isScratchDuration(value.target_duration_seconds)
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["target_duration_seconds"],
+      message: "From Scratch duration must be between 10 and 90 seconds in 10-second steps.",
+    });
+  }
 });
 
 export async function POST(request: Request) {
