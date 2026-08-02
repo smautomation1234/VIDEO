@@ -194,13 +194,17 @@ async function finishOmni(
     status: "completed",
     storage_path: path,
     provider_payload: redact(body),
-    selected: take.take_number === 1,
     last_error: null,
     completed_at: completedAt,
     error_category: null,
     error_code: null,
     error_details: {},
   }).eq("id", take.id);
+  const activationWarning = await activateCompletedRetryIfNeeded(
+    db,
+    take,
+    project
+  );
   await updateJob(db, job.id, {
     status: "completed",
     result: { storage_path: path },
@@ -211,6 +215,12 @@ async function finishOmni(
     error_details: {},
     locked_until: null
   });
+  if (activationWarning) {
+    await event(db, job.id, "warning", activationWarning, {
+      clip_id: take.clip_id,
+      take_id: take.id,
+    });
+  }
   const [pendingResult, failedResult] = await Promise.all([
     db
       .from("clip_takes")
@@ -239,6 +249,72 @@ async function finishOmni(
       : "ready",
   });
   await event(db, job.id, "info", `Take ${take.take_number} completed and was stored.`, { storage_path: path });
+}
+
+/**
+ * A failed first attempt may still be marked selected. When a later attempt
+ * completes, promote it only if the clip has no other playable selected take,
+ * then repair timeline rows that still point at failed or media-less takes.
+ * This is best-effort so a successfully stored video is never marked failed
+ * merely because the selection repair encountered a transient database error.
+ */
+async function activateCompletedRetryIfNeeded(
+  db: DB,
+  take: ClipTake,
+  project: Project
+): Promise<string | null> {
+  try {
+    const { data: selectedPlayable, error: selectedError } = await db
+      .from("clip_takes")
+      .select("id")
+      .eq("clip_id", take.clip_id)
+      .eq("selected", true)
+      .eq("status", "completed")
+      .not("storage_path", "is", null)
+      .limit(1)
+      .maybeSingle();
+    if (selectedError) throw selectedError;
+    if (selectedPlayable) return null;
+
+    const { error: selectError } = await db.rpc("select_clip_take", {
+      p_take_id: take.id,
+      p_user_id: project.user_id,
+    });
+    if (selectError) throw selectError;
+
+    const { data: clipTakes, error: takesError } = await db
+      .from("clip_takes")
+      .select("id,status,storage_path")
+      .eq("clip_id", take.clip_id);
+    if (takesError) throw takesError;
+
+    const invalidTakeIds = (clipTakes || [])
+      .filter(
+        (candidate) =>
+          candidate.id !== take.id &&
+          (candidate.status !== "completed" || !candidate.storage_path)
+      )
+      .map((candidate) => candidate.id);
+
+    if (invalidTakeIds.length) {
+      const { error: repairError } = await db
+        .from("timeline_items")
+        .update({ take_id: take.id })
+        .eq("clip_id", take.clip_id)
+        .in("take_id", invalidTakeIds);
+      if (repairError) throw repairError;
+    }
+
+    const { error: nullRepairError } = await db
+      .from("timeline_items")
+      .update({ take_id: take.id })
+      .eq("clip_id", take.clip_id)
+      .is("take_id", null);
+    if (nullRepairError) throw nullRepairError;
+    return null;
+  } catch (error) {
+    return `Video was stored, but automatic take selection needs retry: ${message(error)}`;
+  }
 }
 
 function omniRequest(project: Project, prompt: string, mime: string, data: string) {
