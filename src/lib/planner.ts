@@ -25,7 +25,12 @@ export async function createReelPlan(project: Project): Promise<ReelPlan> {
   const prompt = plannerPrompt(project);
   const firstResponse = await requestPlannerResponse(prompt);
   try {
-    return parseAndValidatePlan(firstResponse, project.target_duration_seconds);
+    const result = parseAndValidatePlan(
+      firstResponse,
+      project.target_duration_seconds
+    );
+    assertLanguagePreserved(project.raw_post, result.full_script);
+    return result;
   } catch (firstError) {
     const reason =
       firstError instanceof Error ? firstError.message : String(firstError);
@@ -36,10 +41,12 @@ Your previous response was invalid: ${reason}
 Regenerate the complete JSON plan from scratch. Return exactly ${project.target_duration_seconds / 10} clips. Every clip must be exactly 10 seconds, clip numbers must be sequential, and the duration sum must be exactly ${project.target_duration_seconds} seconds. Do not return the previous invalid duration map.`;
     const correctedResponse = await requestPlannerResponse(correctionPrompt);
     try {
-      return parseAndValidatePlan(
+      const result = parseAndValidatePlan(
         correctedResponse,
         project.target_duration_seconds
       );
+      assertLanguagePreserved(project.raw_post, result.full_script);
+      return result;
     } catch (secondError) {
       const correctedReason =
         secondError instanceof Error ? secondError.message : String(secondError);
@@ -47,6 +54,38 @@ Regenerate the complete JSON plan from scratch. Return exactly ${project.target_
         `Gemini returned an invalid clip map after automatic correction. ${correctedReason}`
       );
     }
+  }
+}
+
+const HINGLISH_MARKERS = new Set([
+  "aap", "aapka", "aapke", "aapki", "ab", "agar", "aur", "baaki",
+  "bad", "badh", "banaiye", "batati", "cheez", "cheezein", "chukana",
+  "hai", "hain", "ho", "hogi", "hua", "hui", "humne", "ka", "kar",
+  "kama", "ke", "ki", "kijiye", "kitna", "kya", "lekin", "liye",
+  "lijiye", "lakh", "mein", "mat", "matlab", "nahi", "paisa", "paas",
+  "rahe", "rahi", "rupees", "saare", "saving", "sirf", "toh", "ya",
+  "yeh", "zada", "zyada",
+]);
+
+function words(value: string) {
+  return value
+    .toLocaleLowerCase("en-IN")
+    .normalize("NFKC")
+    .match(/[\p{L}\p{N}]+/gu) || [];
+}
+
+/** Reject a plan that silently translates a Roman-Hindi/Hinglish script. */
+export function assertLanguagePreserved(input: string, output: string) {
+  const inputMarkers = new Set(words(input).filter((word) => HINGLISH_MARKERS.has(word)));
+  if (inputMarkers.size < 3) return;
+
+  const outputWords = new Set(words(output));
+  const retained = [...inputMarkers].filter((word) => outputWords.has(word));
+  const minimumRetained = Math.max(3, Math.ceil(inputMarkers.size * 0.6));
+  if (retained.length < minimumRetained) {
+    throw new Error(
+      `The supplied Hinglish language was translated or rewritten too heavily. Preserve the original Hindi-English code-switching and wording; retain at least ${minimumRetained} of ${inputMarkers.size} language markers.`
+    );
   }
 }
 
@@ -191,10 +230,18 @@ REQUIRED CLIP COUNT: exactly ${project.target_duration_seconds / 10}
 OUTPUT: ${project.aspect_ratio}, ${project.resolution}
 ONLY STYLE AVAILABLE: Paper Effect + Motion Graphics
 
+SCRIPT LANGUAGE LOCK — HIGHEST PRIORITY
+- Detect the language and writing style of RAW POST and preserve it. If it is Hinglish written in Roman letters, the output must remain Hinglish written in Roman letters.
+- Never translate Hindi/Hinglish into English. Never translate English into Hindi. Preserve the author's exact code-switching, tone, sentence order and vocabulary.
+- Treat RAW POST as the final spoken script when it is already written as narration. Edit only what is strictly necessary for timing, factual correction or pronunciation; do not paraphrase merely for style.
+- Keep words such as “aap”, “hai”, “matlab”, “kijiye”, “toh”, “lakh” and similar Hindi words exactly in their supplied language. Do not replace them with English equivalents.
+- Number and symbol expansion must preserve the surrounding language. For example, “₹6 lakh hain” may become “six lakh rupees hain”; it must not become “the assets are six hundred thousand rupees.”
+- full_script and every spoken_line must retain the input language. Split the script into contiguous spoken sections; do not translate while splitting.
+
 SCRIPT RULES
-- Rewrite into natural spoken social-video language without losing the post's essential claims.
+- Polish into natural spoken social-video language only when needed, without changing the supplied language, code-switching, meaning or essential claims.
 - Never invent a fact. Correct unsupported claims and explain corrections in fact_check_notes.
-- Expand every number, symbol, abbreviation and unit into its natural spoken form before counting: 614 GB/s → six hundred fourteen gigabytes per second; M5 → M five; 83.3% → eighty-three point three percent.
+- Expand every number, symbol, abbreviation and unit into a pronunciation-safe form before counting, while preserving the original language around it: ₹6 lakh hain → six lakh rupees hain; 614 GB/s → six hundred fourteen gigabytes per second; M5 → M five.
 - Do not miss, repeat, or cut off a required spoken word. Avoid tongue-twisting constructions.
 - PLAIN pacing = 4.3 spoken words/second. DENSE pacing = 3.3 spoken words/second. A dense line has two or more of: number, unit, model name, comparison.
 - Estimate dense_fraction. Effective wps = 1 / ((dense_fraction/3.3)+((1-dense_fraction)/4.3)). Word ceiling = target seconds × 0.85 × effective wps.
@@ -211,6 +258,7 @@ OMNI PROMPT RULES
 - The prompt must clearly state the selected ${project.aspect_ratio} aspect ratio, ${project.resolution}, exact clip duration, static eye-level camera and consistent voice.
 - Use premium paper-cut editing: restrained torn-paper reveals, matte tape, halftone texture, brand-aware color coding, useful B-roll/motion graphics and phrase-level static subtitles synchronized exactly to speech. Avoid generic talking-head output.
 - Never ask Omni to say compressed symbols. spoken_line is already pronunciation-safe.
+- Copy each spoken_line exactly into the quoted EXACT SPOKEN LINE field. Do not translate or paraphrase it inside the prompt.
 - End naturally and do not continue to the next line.
 
 MANDATORY PROMPT TEMPLATE FOR EVERY CLIP (fill it, do not shorten it):
