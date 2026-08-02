@@ -95,9 +95,12 @@ export function resolveTimelineSegments(
   for (const item of [...items].sort((a, b) => a.order_index - b.order_index)) {
     const clip = clips.find((candidate) => candidate.id === item.clip_id);
     if (!clip) continue;
-    const take =
-      clip.takes.find((candidate) => candidate.id === item.take_id) ||
-      preferredTake(clip.takes);
+    const referencedTake = clip.takes.find(
+      (candidate) => candidate.id === item.take_id
+    );
+    const take = isPlayableTake(referencedTake)
+      ? referencedTake
+      : preferredTake(clip.takes);
     const trimStart = item.source_in_frame / fps;
     const trimEnd = item.source_out_frame / fps;
     const duration = Math.max(1 / fps, trimEnd - trimStart);
@@ -192,10 +195,21 @@ export function splitTimelineItemAtFrame(
   };
 }
 
-function preferredTake(takes: ClipTake[]) {
+export function isPlayableTake(
+  take: ClipTake | null | undefined
+): take is ClipTake {
+  return Boolean(
+    take && take.status === "completed" && take.storage_path
+  );
+}
+
+export function preferredTake(takes: ClipTake[]) {
+  const newestFirst = [...takes].sort(
+    (left, right) => right.take_number - left.take_number
+  );
   return (
-    takes.find((item) => item.selected && item.status === "completed") ||
-    takes.find((item) => item.status === "completed") ||
-    takes[0]
+    newestFirst.find((item) => item.selected && isPlayableTake(item)) ||
+    newestFirst.find(isPlayableTake) ||
+    newestFirst[0]
   );
 }
