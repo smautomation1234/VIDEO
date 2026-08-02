@@ -16,6 +16,7 @@ import {
 import {
   createInitialTimelineItems,
   duplicateTimelineItemAfter,
+  preferredTake,
   rescaleTimelineItemsFps,
   resolveTimelineSegments,
   splitTimelineItemAtFrame,
@@ -117,6 +118,7 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
     Record<string, string>
   >({});
   const [cacheEpoch, setCacheEpoch] = useState(0);
+  const mediaCacheAttemptsRef = useRef<Map<string, number>>(new Map());
 
   // Background Audio Integration
   const [backgroundAudioUrl, setBackgroundAudioUrl] = useState<string | null>(null);
@@ -534,6 +536,7 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
   // a memory Blob is the compatibility fallback.
   useEffect(() => {
     let cancelled = false;
+    const retryTimers = new Set<number>();
     void navigator.storage?.persist?.().catch(() => false);
     const allAssets = Array.from(
       new Map(
@@ -660,6 +663,7 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
             delete next[asset.key];
             return next;
           });
+          mediaCacheAttemptsRef.current.delete(asset.key);
           ready += 1;
         } catch (error) {
           console.warn("Local media cache failed:", asset.key, error);
@@ -670,6 +674,16 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
                 ? error.message
                 : "This clip could not be prepared.",
           }));
+          const attempts =
+            (mediaCacheAttemptsRef.current.get(asset.key) || 0) + 1;
+          mediaCacheAttemptsRef.current.set(asset.key, attempts);
+          if (attempts < 3) {
+            const timer = window.setTimeout(() => {
+              retryTimers.delete(timer);
+              if (!cancelled) setCacheEpoch((value) => value + 1);
+            }, attempts * 1000);
+            retryTimers.add(timer);
+          }
           failed += 1;
         } finally {
           completed += 1;
@@ -692,6 +706,7 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
     });
     return () => {
       cancelled = true;
+      retryTimers.forEach((timer) => window.clearTimeout(timer));
     };
   }, [segments, cacheEpoch]);
 
@@ -777,7 +792,9 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
               status: take.status,
               startedAt: take.started_at,
               createdAt: take.created_at,
-              playable: Boolean(assetKey && localMediaUrls[assetKey]),
+              playable: Boolean(
+                (assetKey && localMediaUrls[assetKey]) || take.signed_url
+              ),
             });
             const value = advanceDisplayedProgress(
               current[take.id] ?? target,
@@ -3283,22 +3300,23 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
                 (latestTake && latestTake.status !== "completed"
                   ? latestTake
                   : undefined) ||
-                clip.takes.find((t) => t.selected && t.status === "completed") ||
-                clip.takes.find((t) => t.status === "completed") ||
+                preferredTake(clip.takes) ||
                 latestTake;
               const assetKey = activeTake?.storage_path || clip.source_chunk_path || "";
               const localVideoUrl = assetKey ? localMediaUrls[assetKey] : "";
               const fallbackVideoUrl = activeTake?.signed_url || clip.signed_source_url;
               const progress = activeTake
                 ? displayedTakeProgress[activeTake.id] ??
-                  (activeTake.status === "completed" && localVideoUrl ? 100 : 0)
+                  (activeTake.status === "completed" &&
+                  (localVideoUrl || fallbackVideoUrl)
+                    ? 100
+                    : 0)
                 : localVideoUrl
                 ? 100
                 : 0;
               const showVideo = activeTake
                 ? activeTake.status === "completed" &&
-                  progress === 100 &&
-                  Boolean(localVideoUrl)
+                  Boolean(localVideoUrl || fallbackVideoUrl)
                 : Boolean(localVideoUrl || fallbackVideoUrl);
               const videoUrl = localVideoUrl || fallbackVideoUrl;
               const errorDetails = activeTake?.error_details || {};
