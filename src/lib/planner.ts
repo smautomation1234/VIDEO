@@ -1,0 +1,313 @@
+import { z } from "zod";
+import { GOOGLE_LOCATION, TEXT_MODEL, requireEnv } from "@/lib/env";
+import { googleAccessToken } from "@/lib/google-auth";
+import { ProviderHttpError } from "@/lib/provider-error";
+import type { Project, ReelPlan } from "@/lib/types";
+import { materializeFullScript } from "@/features/project/prompt-materialization";
+
+export { materializeFullScript } from "@/features/project/prompt-materialization";
+
+const clip = z.object({
+  clip_number: z.number().int().positive(),
+  duration_seconds: z.union([z.literal(4), z.literal(6), z.literal(8), z.literal(10)]),
+  spoken_line: z.string().min(1),
+  prompt: z.string().min(80)
+});
+
+export const plan = z.object({
+  fact_check_notes: z.string(),
+  source_urls: z.array(z.object({ title: z.string(), url: z.string().url() })).max(12),
+  dense_fraction: z.number().min(0).max(1),
+  word_ceiling: z.number().int().positive(),
+  actual_word_count: z.number().int().positive(),
+  full_script: z.string().min(1),
+  clips: z.array(clip).min(1).max(75)
+});
+
+export async function createReelPlan(project: Project): Promise<ReelPlan> {
+  const prompt = plannerPrompt(project);
+  const firstResponse = await requestPlannerResponse(prompt);
+  try {
+    const result = parseAndValidatePlan(
+      firstResponse,
+      project.target_duration_seconds
+    );
+    assertLanguagePreserved(project.raw_post, result.full_script);
+    return result;
+  } catch (firstError) {
+    const reason =
+      firstError instanceof Error ? firstError.message : String(firstError);
+    const correctionPrompt = `${prompt}
+
+CORRECTION REQUIRED:
+Your previous response was invalid: ${reason}
+Regenerate the complete JSON plan from scratch. Return exactly ${project.target_duration_seconds / 10} clips. Every clip must be exactly 10 seconds, clip numbers must be sequential, and the duration sum must be exactly ${project.target_duration_seconds} seconds. Do not return the previous invalid duration map.`;
+    const correctedResponse = await requestPlannerResponse(correctionPrompt);
+    try {
+      const result = parseAndValidatePlan(
+        correctedResponse,
+        project.target_duration_seconds
+      );
+      assertLanguagePreserved(project.raw_post, result.full_script);
+      return result;
+    } catch (secondError) {
+      const correctedReason =
+        secondError instanceof Error ? secondError.message : String(secondError);
+      throw new Error(
+        `Gemini returned an invalid clip map after automatic correction. ${correctedReason}`
+      );
+    }
+  }
+}
+
+const HINGLISH_MARKERS = new Set([
+  "aap", "aapka", "aapke", "aapki", "ab", "agar", "aur", "baaki",
+  "bad", "badh", "banaiye", "batati", "cheez", "cheezein", "chukana",
+  "hai", "hain", "ho", "hogi", "hua", "hui", "humne", "ka", "kar",
+  "kama", "ke", "ki", "kijiye", "kitna", "kya", "lekin", "liye",
+  "lijiye", "lakh", "mein", "mat", "matlab", "nahi", "paisa", "paas",
+  "rahe", "rahi", "rupees", "saare", "saving", "sirf", "toh", "ya",
+  "yeh", "zada", "zyada",
+]);
+
+function words(value: string) {
+  return value
+    .toLocaleLowerCase("en-IN")
+    .normalize("NFKC")
+    .match(/[\p{L}\p{N}]+/gu) || [];
+}
+
+/** Reject a plan that silently translates a Roman-Hindi/Hinglish script. */
+export function assertLanguagePreserved(input: string, output: string) {
+  const inputMarkers = new Set(words(input).filter((word) => HINGLISH_MARKERS.has(word)));
+  if (inputMarkers.size < 3) return;
+
+  const outputWords = new Set(words(output));
+  const retained = [...inputMarkers].filter((word) => outputWords.has(word));
+  const minimumRetained = Math.max(3, Math.ceil(inputMarkers.size * 0.6));
+  if (retained.length < minimumRetained) {
+    throw new Error(
+      `The supplied Hinglish language was translated or rewritten too heavily. Preserve the original Hindi-English code-switching and wording; retain at least ${minimumRetained} of ${inputMarkers.size} language markers.`
+    );
+  }
+}
+
+async function requestPlannerResponse(prompt: string): Promise<string> {
+  const cloudProject = requireEnv("GOOGLE_CLOUD_PROJECT");
+  const accessToken = await googleAccessToken();
+  const location = encodeURIComponent(GOOGLE_LOCATION);
+  const apiHost =
+    GOOGLE_LOCATION === "global"
+      ? "aiplatform.googleapis.com"
+      : `${GOOGLE_LOCATION}-aiplatform.googleapis.com`;
+  const url =
+    `https://${apiHost}/v1/projects/${encodeURIComponent(cloudProject)}` +
+    `/locations/${location}/publishers/google/models/${encodeURIComponent(TEXT_MODEL)}:generateContent`;
+  const requestBody = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: prompt }
+        ]
+      }
+    ],
+    tools: [
+      { googleSearch: {} }
+    ]
+  };
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify(requestBody)
+    });
+  } catch (error) {
+    throw new ProviderHttpError(
+      503,
+      `Could not connect to Gemini: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new ProviderHttpError(
+      res.status,
+      `Gemini API error (HTTP ${res.status}): ${errText.slice(0, 1000)}`
+    );
+  }
+
+  const body = await res.json();
+  const text = body.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  if (!text) {
+    throw new Error("Gemini returned an empty response.");
+  }
+
+  return text;
+}
+
+export function parseAndValidatePlan(
+  text: string,
+  targetDurationSeconds: number
+): ReelPlan {
+  const parsed = plan.parse(extractJson(text));
+  parsed.clips = parsed.clips.map((item) => ({
+    ...item,
+    prompt: materializeFullScript(item.prompt, parsed.full_script),
+  }));
+  const expected = parsed.clips.map((c) => c.clip_number);
+  if (expected.some((value, index) => value !== index + 1)) {
+    throw new Error("Gemini returned non-sequential clip numbers.");
+  }
+
+  const expectedClipCount = targetDurationSeconds / 10;
+  if (!Number.isInteger(expectedClipCount) || expectedClipCount < 1) {
+    throw new Error(
+      `Target duration ${targetDurationSeconds}s is not a positive 10-second increment.`
+    );
+  }
+  if (parsed.clips.length !== expectedClipCount) {
+    throw new Error(
+      `Gemini returned ${parsed.clips.length} clips; exactly ${expectedClipCount} are required.`
+    );
+  }
+  const invalidDuration = parsed.clips.find(
+    (item) => item.duration_seconds !== 10
+  );
+  if (invalidDuration) {
+    throw new Error(
+      `Gemini returned a ${invalidDuration.duration_seconds}s clip; every clip must be exactly 10 seconds.`
+    );
+  }
+
+  const sum = parsed.clips.reduce((total, item) => total + item.duration_seconds, 0);
+  if (sum !== targetDurationSeconds) {
+    throw new Error(
+      `Gemini clip map totals ${sum}s; exactly ${targetDurationSeconds}s is required.`
+    );
+  }
+
+  return parsed;
+}
+
+export function cleanJsonText(json: string): string {
+  let cleaned = json;
+  // 1. Remove single-line and multi-line comments
+  cleaned = cleaned.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, '$1');
+  // 2. Remove trailing commas before closing braces/brackets
+  cleaned = cleaned.replace(/,(\s*[\]}])/g, '$1');
+  // 3. Fix common punctuation errors like "...,." or "...]." or "...}."
+  cleaned = cleaned.replace(/([\]}"\d])\s*[\.,]+\s*(?=")/g, '$1,');
+  return cleaned.trim();
+}
+
+function extractJson(text: string) {
+  const matches = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/ig)];
+  let candidate = "";
+  if (matches.length > 0) {
+    candidate = matches[matches.length - 1][1];
+  } else {
+    candidate = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
+  }
+  const repaired = cleanJsonText(candidate);
+  try {
+    return JSON.parse(repaired);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Gemini did not return valid plan JSON. ${reason}. Response length: ${candidate.length}.`
+    );
+  }
+}
+
+export function plannerPrompt(project: Project) {
+  const splitWise = project.style === "split_wise";
+  const styleName = splitWise
+    ? "Split-Wise B-Roll Editing"
+    : "Paper Effect + Motion Graphics";
+  const styleRules = splitWise
+    ? `- Use a clean top-and-bottom split-screen composition throughout every clip.
+- Keep the presenter continuously visible and speaking in the lower 45 percent. Do not replace, hide or interrupt the lower presenter when the upper visual changes.
+- Use the upper 55 percent only for B-roll, objects, locations, examples, charts, screenshots, clean motion graphics or a suitable presenter reaction close-up that directly supports the words currently being spoken.
+- Change only the upper supporting visual at natural phrase or topic boundaries. Every upper visual must match the exact current sentence; never use random or generic B-roll.
+- Keep a clean straight division between the two sections. Add restrained sound effects for upper-visual changes, motion graphics and emphasis, always quieter than the voice.
+- Do not use paper effects, torn-paper transitions, paper textures, tape, scrapbook styling or halftone effects. Do not add word-by-word subtitles.`
+    : `- Use premium paper-cut editing: restrained torn-paper reveals, matte tape, halftone texture, brand-aware color coding, useful B-roll/motion graphics and phrase-level static subtitles synchronized exactly to speech. Avoid generic talking-head output.`;
+  const clipStyleInstruction = splitWise
+    ? `use clean split-wise B-roll editing. Keep my presenter continuously visible in the lower 45 percent of the screen. Use the upper 55 percent only for relevant B-roll, real-world examples, charts, screenshots, clean motion graphics or a suitable presenter reaction close-up that directly matches the exact words currently being spoken. Change only the upper supporting visual at natural phrase boundaries while keeping the lower presenter continuous. Keep a clean straight separation between both sections. Add proper subtle sound effects below the voice. Do not use any paper effects, torn-paper transitions, paper textures, tape, scrapbook styling or halftone effects. Do not add word-by-word subtitles. Create a polished Instagram-ready video.`
+    : `use paper effect editing, use motion graphics, animations, color coding, and create a video for instagram in full viral format`;
+  return `You are a fact-checking script editor and Google Gemini Omni Flash prompt writer. Complete the entire task in one response. Use web search before writing. Verify current numbers, specifications, comparisons, product names and dates with official sources first and independent reliable sources when useful.
+
+INPUT
+RAW POST:
+${project.raw_post}
+
+TARGET TOTAL DURATION: ${project.target_duration_seconds} seconds
+REQUIRED CLIP COUNT: exactly ${project.target_duration_seconds / 10}
+OUTPUT: ${project.aspect_ratio}, ${project.resolution}
+SELECTED VISUAL STYLE: ${styleName}
+
+SCRIPT LANGUAGE LOCK — HIGHEST PRIORITY
+- Detect the language and writing style of RAW POST and preserve it. If it is Hinglish written in Roman letters, the output must remain Hinglish written in Roman letters.
+- Never translate Hindi/Hinglish into English. Never translate English into Hindi. Preserve the author's exact code-switching, tone, sentence order and vocabulary.
+- Treat RAW POST as the final spoken script when it is already written as narration. Edit only what is strictly necessary for timing, factual correction or pronunciation; do not paraphrase merely for style.
+- Keep words such as “aap”, “hai”, “matlab”, “kijiye”, “toh”, “lakh” and similar Hindi words exactly in their supplied language. Do not replace them with English equivalents.
+- Number and symbol expansion must preserve the surrounding language. For example, “₹6 lakh hain” may become “six lakh rupees hain”; it must not become “the assets are six hundred thousand rupees.”
+- full_script and every spoken_line must retain the input language. Split the script into contiguous spoken sections; do not translate while splitting.
+
+SCRIPT RULES
+- Polish into natural spoken social-video language only when needed, without changing the supplied language, code-switching, meaning or essential claims.
+- Never invent a fact. Correct unsupported claims and explain corrections in fact_check_notes.
+- Expand every number, symbol, abbreviation and unit into a pronunciation-safe form before counting, while preserving the original language around it: ₹6 lakh hain → six lakh rupees hain; 614 GB/s → six hundred fourteen gigabytes per second; M5 → M five.
+- Do not miss, repeat, or cut off a required spoken word. Avoid tongue-twisting constructions.
+- PLAIN pacing = 4.3 spoken words/second. DENSE pacing = 3.3 spoken words/second. A dense line has two or more of: number, unit, model name, comparison.
+- Estimate dense_fraction. Effective wps = 1 / ((dense_fraction/3.3)+((1-dense_fraction)/4.3)). Word ceiling = target seconds × 0.85 × effective wps.
+- Return exactly ${project.target_duration_seconds / 10} clips.
+- Every clip must be exactly 10 seconds. Do not use 4, 6, or 8-second clips.
+- Clip numbers must start at 1 and remain sequential.
+- The clip-duration sum must be exactly ${project.target_duration_seconds} seconds with no tolerance.
+- Keep each spoken_line conservatively short enough for a natural pace. Do not cram.
+
+OMNI PROMPT RULES
+- Every generation is a disconnected session but receives the exact same presenter photo as Image1.
+- Repeat the complete full script inside EVERY clip prompt for context.
+- Preserve the literal supplied face, skin, hair, body, clothing and facial structure. Do not redesign the person.
+- The prompt must clearly state the selected ${project.aspect_ratio} aspect ratio, ${project.resolution}, exact clip duration, static eye-level camera and consistent voice.
+${styleRules}
+- Never ask Omni to say compressed symbols. spoken_line is already pronunciation-safe.
+- Copy each spoken_line exactly into the quoted EXACT SPOKEN LINE field. Do not translate or paraphrase it inside the prompt.
+- End naturally and do not continue to the next line.
+
+MANDATORY PROMPT TEMPLATE FOR EVERY CLIP (fill it, do not shorten it):
+this is full script and i am giving you my image also so keep the character consistent and do not change face structure
+
+{{FULL FINAL SCRIPT}}
+
+{{For clip 2 onward: "till line N-1 video is already done, so start from line N and no need to say anything extra"}}
+
+only speak this line, nothing else, do not continue to any other line even though it's part of the script above:
+
+"{{EXACT SPOKEN LINE}}"
+
+be at natural pace, do not miss any word and do not fumble. Keep it naturally paced. Do not stutter or say any word two times. After finishing, stop naturally. Do not add anything extra.
+
+Create exactly a {{DURATION}}-second ${project.aspect_ratio} ${project.resolution} video.
+
+${clipStyleInstruction}
+
+Return JSON only with exactly this shape:
+{
+  "fact_check_notes":"plain prose",
+  "source_urls":[{"title":"source title","url":"https://..."}],
+  "dense_fraction":0.0,
+  "word_ceiling":100,
+  "actual_word_count":95,
+  "full_script":"the complete pronunciation-safe script",
+  "clips":[{"clip_number":1,"duration_seconds":10,"spoken_line":"...","prompt":"complete mandatory prompt"}]
+}`;
+}
