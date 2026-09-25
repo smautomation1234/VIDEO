@@ -3,10 +3,12 @@ import test from "node:test";
 import {
   duplicateTimelineItemAfter,
   normalizeTimelineItems,
+  preferredTake,
   rescaleTimelineItemsFps,
+  resolveTimelineSegments,
   splitTimelineItemAtFrame,
 } from "../src/features/timeline/domain";
-import type { TimelineItem } from "../src/lib/types";
+import type { Clip, ClipTake, TimelineItem } from "../src/lib/types";
 
 function item(id: string, start: number, end: number, order = 0): TimelineItem {
   return {
@@ -71,4 +73,58 @@ test("legacy 25 FPS boundaries rescale to 24 FPS without changing time", () => {
   assert.equal(result.source_out_frame, 240);
   assert.equal(result.source_in_frame / 24, 2);
   assert.equal(result.source_out_frame / 24, 10);
+});
+
+function take(
+  id: string,
+  takeNumber: number,
+  status: ClipTake["status"],
+  selected: boolean,
+  storagePath: string | null
+): ClipTake {
+  return {
+    id,
+    project_id: "00000000-0000-4000-8000-000000000010",
+    clip_id: "00000000-0000-4000-8000-000000000002",
+    take_number: takeNumber,
+    status,
+    selected,
+    trim_start_seconds: 0,
+    trim_end_seconds: null,
+    storage_path: storagePath,
+    provider_interaction_id: null,
+    provider_payload: {},
+    last_error: status === "failed" ? "Prompt rejected" : null,
+    created_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+test("successful retry replaces a selected failed take", () => {
+  const failed = take("failed", 1, "failed", true, null);
+  const completed = take("completed", 2, "completed", false, "video.mp4");
+  assert.equal(preferredTake([failed, completed])?.id, completed.id);
+});
+
+test("timeline resolution ignores an invalid persisted failed take", () => {
+  const failed = take("failed", 1, "failed", true, null);
+  const completed = take("completed", 2, "completed", false, "video.mp4");
+  const timelineItem = {
+    ...item("timeline-item", 0, 240),
+    take_id: failed.id,
+  };
+  const clip: Clip & { takes: ClipTake[] } = {
+    id: failed.clip_id,
+    project_id: failed.project_id,
+    clip_number: 1,
+    duration_seconds: 10,
+    spoken_line: "Test",
+    prompt: "Test",
+    source_chunk_path: null,
+    created_at: "2026-01-01T00:00:00.000Z",
+    takes: [failed, completed],
+  };
+  const [segment] = resolveTimelineSegments([timelineItem], [clip], 24);
+  assert.equal(segment.take?.id, completed.id);
+  assert.equal(segment.assetKey, completed.storage_path);
 });

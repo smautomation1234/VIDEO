@@ -2,8 +2,8 @@
 
 ReelForge creates short-form videos in two modes:
 
-- **From Scratch** — Gemini 2.5 Flash creates a fact-checked script and clip
-  prompts, then Gemini Omni Flash generates each clip from one presenter image.
+- **From Scratch** — Gemini creates a fact-checked script and clip prompts,
+  then Gemini Omni Flash generates each clip from one presenter image.
 - **Edit Video** — the browser divides an uploaded video into frame-accurate
   segments, then Gemini Omni Flash edits each segment while preserving its
   original timing and audio.
@@ -45,7 +45,6 @@ Requirements:
 
 - Node.js 22
 - A Supabase project
-- A Gemini API key
 - A Google Cloud project and service account with Gemini Omni Flash access
 
 Copy `.env.example` to `.env` and fill every required value.
@@ -107,7 +106,10 @@ from confusing the function's `timeline_id` output with the table column.
 
 ### 1. Add Vercel environment variables
 
-Add all variables from `.env.example` to the Vercel project. Prefer Supabase's
+Add all variables from `.env.example` to the Vercel project. Omni generation
+uses only the Vertex AI Agent Platform Interactions API with the Vertex model ID
+`gemini-omni-flash-preview`. Set the model explicitly in Vercel so production
+selection remains auditable. Prefer Supabase's
 current `sb_secret_...` key in `SUPABASE_SECRET_KEY`; the legacy service-role
 variable remains supported during migration. Generate a strong random
 `CRON_SECRET` with at least 32 characters.
@@ -202,5 +204,5 @@ tests/                    Pure domain tests
 
 This workspace previously contained an unignored `.env`. If that file was ever
 uploaded to GitHub or shared, rotate the Supabase server secret/service-role
-key, Gemini key, Google service-account credentials, and `CRON_SECRET` before
+key, Google Cloud project, Google service-account credentials, and `CRON_SECRET` before
 deploying.

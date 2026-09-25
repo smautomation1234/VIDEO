@@ -1,0 +1,30 @@
+# Dependencies and build output
+node_modules/
+.next/
+out/
+.vercel/
+coverage/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Generated caches and logs
+*.log
+*.zip
+*.tsbuildinfo
+.eslintcache
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Private infrastructure backups (never commit user data or media)
+scratch/supabase-backup-*/
+scratch/google-credentials/
+
+.vercel
+.env*.local

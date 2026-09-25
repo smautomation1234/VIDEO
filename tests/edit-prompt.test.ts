@@ -17,3 +17,21 @@ test("builds one complete edit instruction with dynamic output values", () => {
   assert.match(prompt, /paper effect editing/);
   assert.equal(prompt.match(/TECHNICAL OUTPUT LOCK:/g)?.length, 1);
 });
+
+test("builds split-wise edit instructions without paper styling", () => {
+  const prompt = buildEditVideoPrompt({
+    aspectRatio: "9:16",
+    resolution: "720p",
+    durationSeconds: 10,
+    style: "split_wise",
+  });
+
+  assert.match(prompt, /lower 45 percent/);
+  assert.match(prompt, /upper 55 percent/);
+  assert.match(prompt, /change only the upper supporting visual/);
+  assert.match(prompt, /sound effect lower than my voice/);
+  assert.match(prompt, /do not use paper effects/);
+  assert.doesNotMatch(prompt, /by using paper effect editing/);
+  assert.match(prompt, /exactly 10 seconds, 9:16, 720p/);
+  assert.equal(prompt.match(/TECHNICAL OUTPUT LOCK:/g)?.length, 1);
+});
